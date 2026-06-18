@@ -9,7 +9,6 @@ const { Pool } = pg;
 const app = express();
 
 app.use(cors());
-app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL_READONLY = process.env.DATABASE_URL_READONLY;
@@ -27,6 +26,81 @@ const pool = DATABASE_URL_READONLY
     })
   : null;
 
+// ---------------------------------------------------------------------------
+// MCP / SSE endpoints — registered BEFORE any body-parsing middleware so that
+// the raw request stream is still readable when SSEServerTransport processes
+// the POST /message body. A global express.json() would consume the stream
+// first and cause transport.handlePostMessage() to fail with "stream is not
+// readable".
+// ---------------------------------------------------------------------------
+
+// Active SSE transports keyed by a per-connection session ID so that the
+// companion POST /message endpoint can route messages to the right transport.
+// Each SSE connection gets its own MCP Server instance — the SDK's Server
+// class is not designed to be shared across multiple concurrent transports.
+const sseTransports = new Map();
+
+app.get("/sse", async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      status: "error",
+      message: "DATABASE_URL_READONLY is not configured"
+    });
+  }
+
+  // Do NOT set SSE headers manually — SSEServerTransport handles that
+  // internally. Setting them here causes a double-header conflict that
+  // prevents the transport from initialising correctly.
+  const transport = new SSEServerTransport("/message", res);
+  const sessionId = transport.sessionId;
+  sseTransports.set(sessionId, transport);
+
+  req.on("close", () => {
+    sseTransports.delete(sessionId);
+    transport.close().catch(() => {});
+  });
+
+  // Create a fresh MCP server for each connection. The SDK's Server class
+  // maintains per-connection state and cannot be shared across transports.
+  const mcpServer = createMcpServer(pool);
+  await mcpServer.connect(transport);
+});
+
+// The SDK's SSEServerTransport expects a companion POST endpoint at the path
+// passed to its constructor ("/message") to receive client→server messages.
+// The client includes the sessionId as a query parameter, which the transport
+// sends to the client in the initial SSE "endpoint" event.
+app.post("/message", async (req, res) => {
+  const sessionId = req.query.sessionId;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId query parameter" });
+  }
+
+  const transport = sseTransports.get(sessionId);
+
+  if (!transport) {
+    return res.status(400).json({ error: `No active session: ${sessionId}` });
+  }
+
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (err) {
+    console.error("Error handling MCP message:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// HTTP / database endpoints — express.json() is scoped to this router so it
+// never runs before the MCP routes above.
+// ---------------------------------------------------------------------------
+
+const dbRouter = express.Router();
+dbRouter.use(express.json());
+
 app.get("/health", async (req, res) => {
   res.json({
     status: "ok",
@@ -35,7 +109,7 @@ app.get("/health", async (req, res) => {
   });
 });
 
-app.get("/db/health", async (req, res) => {
+dbRouter.get("/health", async (req, res) => {
   if (!pool) {
     return res.status(500).json({
       status: "error",
@@ -60,7 +134,7 @@ app.get("/db/health", async (req, res) => {
   }
 });
 
-app.get("/db/tables", async (req, res) => {
+dbRouter.get("/tables", async (req, res) => {
   if (!pool) {
     return res.status(500).json({
       status: "error",
@@ -90,7 +164,7 @@ app.get("/db/tables", async (req, res) => {
   }
 });
 
-app.post("/db/query", async (req, res) => {
+dbRouter.post("/query", async (req, res) => {
   if (!pool) {
     return res.status(500).json({
       status: "error",
@@ -157,68 +231,7 @@ app.post("/db/query", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// MCP / SSE endpoint
-// ---------------------------------------------------------------------------
-
-// Active SSE transports keyed by a per-connection session ID so that the
-// companion POST /message endpoint can route messages to the right transport.
-// Each SSE connection gets its own MCP Server instance — the SDK's Server
-// class is not designed to be shared across multiple concurrent transports.
-const sseTransports = new Map();
-
-app.get("/sse", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      status: "error",
-      message: "DATABASE_URL_READONLY is not configured"
-    });
-  }
-
-  // Do NOT set SSE headers manually — SSEServerTransport handles that
-  // internally. Setting them here causes a double-header conflict that
-  // prevents the transport from initialising correctly.
-  const transport = new SSEServerTransport("/message", res);
-  const sessionId = transport.sessionId;
-  sseTransports.set(sessionId, transport);
-
-  req.on("close", () => {
-    sseTransports.delete(sessionId);
-    transport.close().catch(() => {});
-  });
-
-  // Create a fresh MCP server for each connection. The SDK's Server class
-  // maintains per-connection state and cannot be shared across transports.
-  const mcpServer = createMcpServer(pool);
-  await mcpServer.connect(transport);
-});
-
-// The SDK's SSEServerTransport expects a companion POST endpoint at the path
-// passed to its constructor ("/message") to receive client→server messages.
-// The client includes the sessionId as a query parameter, which the transport
-// sends to the client in the initial SSE "endpoint" event.
-app.post("/message", async (req, res) => {
-  const sessionId = req.query.sessionId;
-
-  if (!sessionId) {
-    return res.status(400).json({ error: "Missing sessionId query parameter" });
-  }
-
-  const transport = sseTransports.get(sessionId);
-
-  if (!transport) {
-    return res.status(400).json({ error: `No active session: ${sessionId}` });
-  }
-
-  try {
-    await transport.handlePostMessage(req, res);
-  } catch (err) {
-    console.error("Error handling MCP message:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-});
+app.use("/db", dbRouter);
 
 // ---------------------------------------------------------------------------
 
