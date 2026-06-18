@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import pg from "pg";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { createMcpServer } from "./mcp-server.js";
 
 const { Pool } = pg;
 
@@ -154,6 +156,57 @@ app.post("/db/query", async (req, res) => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// MCP / SSE endpoint
+// ---------------------------------------------------------------------------
+
+// One MCP server instance shared across all SSE connections.
+const mcpServer = pool ? createMcpServer(pool) : null;
+
+// Active SSE transports keyed by a per-connection session ID so that the
+// companion POST /message endpoint can route messages to the right transport.
+const sseTransports = new Map();
+
+app.get("/sse", async (req, res) => {
+  if (!mcpServer) {
+    return res.status(503).json({
+      status: "error",
+      message: "DATABASE_URL_READONLY is not configured"
+    });
+  }
+
+  // SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const transport = new SSEServerTransport("/message", res);
+  const sessionId = transport.sessionId;
+  sseTransports.set(sessionId, transport);
+
+  req.on("close", () => {
+    sseTransports.delete(sessionId);
+  });
+
+  await mcpServer.connect(transport);
+});
+
+// The SDK's SSEServerTransport expects a companion POST endpoint at the path
+// passed to its constructor ("/message") to receive client→server messages.
+app.post("/message", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = sseTransports.get(sessionId);
+
+  if (!transport) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  await transport.handlePostMessage(req, res);
+});
+
+// ---------------------------------------------------------------------------
 
 app.listen(PORT, () => {
   console.log(`vertra-mcp-postgres listening on port ${PORT}`);
