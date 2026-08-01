@@ -147,6 +147,7 @@ This unblocks only that one call. The next call will block again unless you upda
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Service liveness check (no DB call) |
+| `GET` | `/ready` | Readiness check with a `SELECT 1` against PostgreSQL |
 | `GET` | `/db/health` | DB connectivity check |
 | `GET` | `/db/tables` | Lists tables in `public` schema |
 | `POST` | `/db/query` | Runs a read-only SQL query; body: `{"sql": "..."}` |

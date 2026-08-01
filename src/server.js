@@ -109,6 +109,25 @@ app.get("/health", async (req, res) => {
   });
 });
 
+app.get("/ready", async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      status: "not_ready",
+      dependency: "postgres"
+    });
+  }
+
+  try {
+    await pool.query("SELECT 1");
+    return res.json({ status: "ready" });
+  } catch {
+    return res.status(503).json({
+      status: "not_ready",
+      dependency: "postgres"
+    });
+  }
+});
+
 dbRouter.get("/health", async (req, res) => {
   if (!pool) {
     return res.status(500).json({
