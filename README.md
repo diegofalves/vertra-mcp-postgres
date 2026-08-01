@@ -9,20 +9,34 @@ The server runs as an Express HTTP service with two layers:
 - **MCP/SSE layer** — `GET /sse` opens a persistent SSE connection; `POST /message` receives client-to-server messages. Each connection gets its own MCP `Server` instance.
 - **HTTP/DB layer** — REST endpoints (`/health`, `/db/health`, `/db/tables`, `/db/query`) for direct inspection and health checks.
 
-All paths that touch the database enforce read-only access: only `SELECT` and `WITH` queries are accepted; write and DDL keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, `COPY`, `GRANT`, `REVOKE`, `VACUUM`, `ANALYZE`, `SET`, `RESET`) are blocked at the application level.
+`/health` and `/ready` are public probes. Every MCP or database route requires
+`Authorization: Bearer <MCP_API_KEY>`. Read-only queries run inside a bounded
+`READ ONLY` transaction and return at most 500 rows.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `DATABASE_URL_READONLY` | Yes | PostgreSQL connection string for the read-only Railway database |
+| `MCP_API_KEY` | Yes | Bearer token required by all MCP and `/db/*` routes |
+| `MCP_ALLOWED_ORIGINS` | No | Comma-separated browser origins; empty denies browser CORS while allowing non-browser clients |
+| `MCP_ENABLE_REST_QUERY` | No | Enables `POST /db/query`; disabled by default |
+| `MCP_DB_POOL_MAX` | No | Maximum PostgreSQL pool size (default `4`, maximum `20`) |
+| `MCP_DB_CONNECT_TIMEOUT_MS` | No | Connection timeout (default `5000`) |
+| `MCP_DB_STATEMENT_TIMEOUT_MS` | No | Query timeout (default `5000`, maximum `60000`) |
+| `MCP_DB_LOCK_TIMEOUT_MS` | No | PostgreSQL lock timeout (default `1000`) |
+| `MCP_DB_IDLE_TRANSACTION_TIMEOUT_MS` | No | Idle transaction timeout (default `5000`) |
+| `SENTRY_DSN` | No | Enables Sentry error tracking when configured |
+| `SENTRY_ENVIRONMENT` | No | Sentry environment; defaults to Railway environment |
+| `SENTRY_RELEASE` | No | Release identifier; defaults to Railway commit SHA |
+| `SENTRY_TRACES_SAMPLE_RATE` | No | Trace sample rate (default `0.05`) |
 | `PORT` | No | HTTP port (default: `3000`) |
 
 ## Running locally
 
 ```bash
 npm install
-DATABASE_URL_READONLY=postgres://... npm start
+DATABASE_URL_READONLY=postgres://... MCP_API_KEY=... npm start
 ```
 
 ## MCP tools
@@ -68,6 +82,10 @@ Returns the total row count for a given table. Validates that the table exists b
 ### SSE endpoint
 
 Point the MCP toolset at the deployed service's `/sse` endpoint:
+
+The client must send the API key as an `Authorization: Bearer` header. Store
+the key in the client's secret store; never put it in the URL, repository or
+logs.
 
 ```python
 import anthropic
@@ -148,8 +166,19 @@ This unblocks only that one call. The next call will block again unless you upda
 |---|---|---|
 | `GET` | `/health` | Service liveness check (no DB call) |
 | `GET` | `/ready` | Readiness check with a `SELECT 1` against PostgreSQL |
-| `GET` | `/db/health` | DB connectivity check |
-| `GET` | `/db/tables` | Lists tables in `public` schema |
-| `POST` | `/db/query` | Runs a read-only SQL query; body: `{"sql": "..."}` |
-| `GET` | `/sse` | Opens MCP SSE connection |
-| `POST` | `/message?sessionId=<id>` | MCP client-to-server message channel |
+| `GET` | `/db/health` | Authenticated DB connectivity check |
+| `GET` | `/db/tables` | Authenticated table list for allowed schemas |
+| `POST` | `/db/query` | Authenticated optional REST query; disabled by default |
+| `GET` | `/sse` | Opens an authenticated MCP SSE connection |
+| `POST` | `/message?sessionId=<id>` | Authenticated MCP client-to-server channel |
+
+## Validation
+
+```bash
+npm ci
+npm test
+```
+
+Production acceptance requires public `/health` and `/ready` to return 2xx,
+all protected routes to return 401 without a Bearer token, and an authorized
+MCP client to complete a read-only `SELECT 1`.

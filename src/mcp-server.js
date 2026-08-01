@@ -18,13 +18,13 @@ import { createMcpTools } from "./mcp-tools.js";
  * @param {import('pg').Pool} pool
  * @returns {import('@modelcontextprotocol/sdk/server/index.js').Server}
  */
-export function createMcpServer(pool) {
+export function createMcpServer(pool, options = {}) {
   const server = new Server(
     { name: "vertra-mcp-postgres", version: "0.1.0" },
     { capabilities: { tools: {} } }
   );
 
-  const tools = createMcpTools(pool);
+  const tools = createMcpTools(pool, options);
 
   // Advertise available tools to the client.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({

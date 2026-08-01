@@ -1,259 +1,232 @@
-import express from "express";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
 import cors from "cors";
+import express from "express";
 import pg from "pg";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+
 import { createMcpServer } from "./mcp-server.js";
+import { attachExpressErrorHandler, captureException, initObservability } from "./observability.js";
+import { executeReadOnlyQuery } from "./read-only-query.js";
 
 const { Pool } = pg;
 
-const app = express();
-
-app.use(cors());
-
-const PORT = process.env.PORT || 3000;
-const DATABASE_URL_READONLY = process.env.DATABASE_URL_READONLY;
-
-if (!DATABASE_URL_READONLY) {
-  console.warn("DATABASE_URL_READONLY is not configured.");
+function envInteger(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(String(process.env[name] || ""), 10);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    return fallback;
+  }
+  return parsed;
 }
 
-const pool = DATABASE_URL_READONLY
-  ? new Pool({
-      connectionString: DATABASE_URL_READONLY,
-      ssl: {
-        rejectUnauthorized: false
-      }
-    })
-  : null;
+function envBoolean(name, fallback = false) {
+  const raw = String(process.env[name] || "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
 
-// ---------------------------------------------------------------------------
-// MCP / SSE endpoints — registered BEFORE any body-parsing middleware so that
-// the raw request stream is still readable when SSEServerTransport processes
-// the POST /message body. A global express.json() would consume the stream
-// first and cause transport.handlePostMessage() to fail with "stream is not
-// readable".
-// ---------------------------------------------------------------------------
+function parseAllowedOrigins(raw = process.env.MCP_ALLOWED_ORIGINS) {
+  return new Set(
+    String(raw || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
+}
 
-// Active SSE transports keyed by a per-connection session ID so that the
-// companion POST /message endpoint can route messages to the right transport.
-// Each SSE connection gets its own MCP Server instance — the SDK's Server
-// class is not designed to be shared across multiple concurrent transports.
-const sseTransports = new Map();
+function safeSecretEqual(provided, expected) {
+  const providedDigest = crypto.createHash("sha256").update(provided).digest();
+  const expectedDigest = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(providedDigest, expectedDigest);
+}
 
-app.get("/sse", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      status: "error",
-      message: "DATABASE_URL_READONLY is not configured"
-    });
-  }
-
-  // Do NOT set SSE headers manually — SSEServerTransport handles that
-  // internally. Setting them here causes a double-header conflict that
-  // prevents the transport from initialising correctly.
-  const transport = new SSEServerTransport("/message", res);
-  const sessionId = transport.sessionId;
-  sseTransports.set(sessionId, transport);
-
-  req.on("close", () => {
-    sseTransports.delete(sessionId);
-    transport.close().catch(() => {});
-  });
-
-  // Create a fresh MCP server for each connection. The SDK's Server class
-  // maintains per-connection state and cannot be shared across transports.
-  const mcpServer = createMcpServer(pool);
-  await mcpServer.connect(transport);
-});
-
-// The SDK's SSEServerTransport expects a companion POST endpoint at the path
-// passed to its constructor ("/message") to receive client→server messages.
-// The client includes the sessionId as a query parameter, which the transport
-// sends to the client in the initial SSE "endpoint" event.
-app.post("/message", async (req, res) => {
-  const sessionId = req.query.sessionId;
-
-  if (!sessionId) {
-    return res.status(400).json({ error: "Missing sessionId query parameter" });
-  }
-
-  const transport = sseTransports.get(sessionId);
-
-  if (!transport) {
-    return res.status(400).json({ error: `No active session: ${sessionId}` });
-  }
-
-  try {
-    await transport.handlePostMessage(req, res);
-  } catch (err) {
-    console.error("Error handling MCP message:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error" });
+function bearerAuth(apiKey) {
+  return (req, res, next) => {
+    const authorization = String(req.get("authorization") || "");
+    const match = authorization.match(/^Bearer\s+(.+)$/i);
+    if (!match || !safeSecretEqual(match[1], apiKey)) {
+      res.set("WWW-Authenticate", "Bearer");
+      return res.status(401).json({ error: "Unauthorized" });
     }
+    return next();
+  };
+}
+
+export function createDatabasePool() {
+  const connectionString = process.env.DATABASE_URL_READONLY;
+  if (!connectionString) {
+    console.warn("DATABASE_URL_READONLY is not configured.");
+    return null;
   }
-});
 
-// ---------------------------------------------------------------------------
-// HTTP / database endpoints — express.json() is scoped to this router so it
-// never runs before the MCP routes above.
-// ---------------------------------------------------------------------------
+  const statementTimeoutMs = envInteger("MCP_DB_STATEMENT_TIMEOUT_MS", 5000, { max: 60000 });
+  const lockTimeoutMs = envInteger("MCP_DB_LOCK_TIMEOUT_MS", 1000, { max: 10000 });
+  const idleTransactionTimeoutMs = envInteger("MCP_DB_IDLE_TRANSACTION_TIMEOUT_MS", 5000, { max: 60000 });
 
-const dbRouter = express.Router();
-dbRouter.use(express.json());
-
-app.get("/health", async (req, res) => {
-  res.json({
-    status: "ok",
-    service: "vertra-mcp-postgres",
-    databaseConfigured: Boolean(DATABASE_URL_READONLY)
+  return new Pool({
+    connectionString,
+    ssl: { rejectUnauthorized: false },
+    max: envInteger("MCP_DB_POOL_MAX", 4, { max: 20 }),
+    connectionTimeoutMillis: envInteger("MCP_DB_CONNECT_TIMEOUT_MS", 5000, { max: 30000 }),
+    query_timeout: statementTimeoutMs + 1000,
+    options: [
+      `-c statement_timeout=${statementTimeoutMs}`,
+      `-c lock_timeout=${lockTimeoutMs}`,
+      `-c idle_in_transaction_session_timeout=${idleTransactionTimeoutMs}`,
+      "-c application_name=vertra-mcp-postgres"
+    ].join(" ")
   });
-});
+}
 
-app.get("/ready", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      status: "not_ready",
-      dependency: "postgres"
-    });
+export function createApp({
+  pool = createDatabasePool(),
+  apiKey = process.env.MCP_API_KEY,
+  allowedOrigins = parseAllowedOrigins(),
+  enableRestQuery = envBoolean("MCP_ENABLE_REST_QUERY", false),
+  queryTimeoutMs = envInteger("MCP_DB_STATEMENT_TIMEOUT_MS", 5000, { max: 60000 })
+} = {}) {
+  if (!String(apiKey || "").trim()) {
+    throw new Error("MCP_API_KEY is required");
   }
 
-  try {
-    await pool.query("SELECT 1");
-    return res.json({ status: "ready" });
-  } catch {
-    return res.status(503).json({
-      status: "not_ready",
-      dependency: "postgres"
-    });
-  }
-});
+  const app = express();
+  const origins = allowedOrigins instanceof Set ? allowedOrigins : new Set(allowedOrigins || []);
 
-dbRouter.get("/health", async (req, res) => {
-  if (!pool) {
-    return res.status(500).json({
-      status: "error",
-      message: "DATABASE_URL_READONLY is not configured"
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      "SELECT current_user, current_database(), now() AS server_time"
-    );
-
-    res.json({
-      status: "ok",
-      database: result.rows[0]
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: "error",
-      message: error.message
-    });
-  }
-});
-
-dbRouter.get("/tables", async (req, res) => {
-  if (!pool) {
-    return res.status(500).json({
-      status: "error",
-      message: "DATABASE_URL_READONLY is not configured"
-    });
-  }
-
-  try {
-    const result = await pool.query(`
-      SELECT table_schema, table_name
-      FROM information_schema.tables
-      WHERE table_schema = 'public'
-        AND table_type = 'BASE TABLE'
-      ORDER BY table_name
-      LIMIT 100
-    `);
-
-    res.json({
-      status: "ok",
-      tables: result.rows
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: "error",
-      message: error.message
-    });
-  }
-});
-
-dbRouter.post("/query", async (req, res) => {
-  if (!pool) {
-    return res.status(500).json({
-      status: "error",
-      message: "DATABASE_URL_READONLY is not configured"
-    });
-  }
-
-  const sql = String(req.body?.sql || "").trim();
-
-  if (!sql) {
-    return res.status(400).json({
-      status: "error",
-      message: "SQL is required"
-    });
-  }
-
-  const normalized = sql.toLowerCase();
-
-  const isReadOnly =
-    normalized.startsWith("select") ||
-    normalized.startsWith("with");
-
-  const forbidden = [
-    "insert ",
-    "update ",
-    "delete ",
-    "drop ",
-    "alter ",
-    "truncate ",
-    "create ",
-    "copy ",
-    "grant ",
-    "revoke ",
-    "vacuum ",
-    "analyze ",
-    "set ",
-    "reset "
-  ];
-
-  const hasForbiddenCommand = forbidden.some((keyword) =>
-    normalized.includes(keyword)
+  app.disable("x-powered-by");
+  app.use(
+    cors({
+      origin(origin, callback) {
+        if (!origin || origins.has(origin)) return callback(null, true);
+        return callback(null, false);
+      },
+      methods: ["GET", "POST"],
+      allowedHeaders: ["Authorization", "Content-Type"]
+    })
   );
 
-  if (!isReadOnly || hasForbiddenCommand) {
-    return res.status(403).json({
-      status: "error",
-      message: "Only read-only SELECT/WITH queries are allowed"
-    });
-  }
-
-  try {
-    const result = await pool.query(sql);
-
+  app.get("/health", (req, res) => {
     res.json({
       status: "ok",
-      rowCount: result.rowCount,
-      rows: result.rows.slice(0, 500)
+      service: "vertra-mcp-postgres",
+      databaseConfigured: Boolean(pool)
     });
-  } catch (error) {
-    res.status(500).json({
-      status: "error",
-      message: error.message
+  });
+
+  app.get("/ready", async (req, res) => {
+    if (!pool) {
+      return res.status(503).json({ status: "not_ready", dependency: "postgres" });
+    }
+    try {
+      await pool.query("SELECT 1");
+      return res.json({ status: "ready" });
+    } catch {
+      return res.status(503).json({ status: "not_ready", dependency: "postgres" });
+    }
+  });
+
+  // Every route below this point can expose database metadata or data.
+  app.use(bearerAuth(String(apiKey)));
+
+  const sseTransports = new Map();
+
+  app.get("/sse", async (req, res) => {
+    if (!pool) {
+      return res.status(503).json({ status: "error", message: "Database is not configured" });
+    }
+
+    const transport = new SSEServerTransport("/message", res);
+    sseTransports.set(transport.sessionId, transport);
+    req.on("close", () => {
+      sseTransports.delete(transport.sessionId);
+      transport.close().catch(() => {});
     });
-  }
-});
 
-app.use("/db", dbRouter);
+    const mcpServer = createMcpServer(pool, { queryTimeoutMs });
+    return mcpServer.connect(transport);
+  });
 
-// ---------------------------------------------------------------------------
+  app.post("/message", async (req, res) => {
+    const sessionId = req.query.sessionId;
+    if (!sessionId) return res.status(400).json({ error: "Missing sessionId query parameter" });
 
-app.listen(PORT, () => {
-  console.log(`vertra-mcp-postgres listening on port ${PORT}`);
-});
+    const transport = sseTransports.get(sessionId);
+    if (!transport) return res.status(400).json({ error: "No active session" });
+
+    try {
+      return await transport.handlePostMessage(req, res);
+    } catch (error) {
+      captureException(error);
+      console.error("Error handling MCP message:", error.message);
+      if (!res.headersSent) return res.status(500).json({ error: "Internal server error" });
+      return undefined;
+    }
+  });
+
+  const dbRouter = express.Router();
+  dbRouter.use(express.json({ limit: "32kb" }));
+
+  dbRouter.get("/health", async (req, res) => {
+    if (!pool) return res.status(503).json({ status: "error", message: "Database is not configured" });
+    try {
+      const result = await pool.query(
+        "SELECT current_user, current_database(), now() AS server_time"
+      );
+      return res.json({ status: "ok", database: result.rows[0] });
+    } catch (error) {
+      captureException(error);
+      return res.status(503).json({ status: "error", message: "Database is unavailable" });
+    }
+  });
+
+  dbRouter.get("/tables", async (req, res) => {
+    if (!pool) return res.status(503).json({ status: "error", message: "Database is not configured" });
+    try {
+      const result = await pool.query(`
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_schema IN ('public', 'rf_stg')
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_schema, table_name
+        LIMIT 200
+      `);
+      return res.json({ status: "ok", tables: result.rows });
+    } catch (error) {
+      captureException(error);
+      return res.status(503).json({ status: "error", message: "Database is unavailable" });
+    }
+  });
+
+  dbRouter.post("/query", async (req, res) => {
+    if (!enableRestQuery) return res.status(404).json({ status: "error", message: "Not found" });
+    if (!pool) return res.status(503).json({ status: "error", message: "Database is not configured" });
+    try {
+      const result = await executeReadOnlyQuery(pool, req.body?.sql, { timeoutMs: queryTimeoutMs });
+      return res.json({ status: "ok", ...result });
+    } catch (error) {
+      captureException(error);
+      const status = error.code === "INVALID_READ_ONLY_QUERY" ? 403 : 500;
+      return res.status(status).json({
+        status: "error",
+        message: status === 403 ? error.message : "Query failed"
+      });
+    }
+  });
+
+  app.use("/db", dbRouter);
+  attachExpressErrorHandler(app);
+  return app;
+}
+
+export function startServer() {
+  initObservability();
+  const app = createApp();
+  const port = envInteger("PORT", 3000, { max: 65535 });
+  return app.listen(port, () => {
+    console.log(`vertra-mcp-postgres listening on port ${port}`);
+  });
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  startServer();
+}

@@ -2,38 +2,9 @@
  * MCP tool implementations for read-only PostgreSQL access.
  */
 
+import { executeReadOnlyQuery } from "./read-only-query.js";
+
 const ALLOWED_SCHEMAS = ["public", "rf_stg"];
-
-const FORBIDDEN_COMMANDS = [
-  "insert ",
-  "update ",
-  "delete ",
-  "drop ",
-  "alter ",
-  "truncate ",
-  "create ",
-  "copy ",
-  "grant ",
-  "revoke ",
-  "vacuum ",
-  "analyze ",
-  "set ",
-  "reset "
-];
-
-/**
- * Returns true if the SQL is a read-only SELECT or WITH query
- * and contains no forbidden write/DDL commands.
- */
-function isReadOnlySql(sql) {
-  const normalized = sql.toLowerCase();
-  const startsOk =
-    normalized.startsWith("select") || normalized.startsWith("with");
-  const hasForbidden = FORBIDDEN_COMMANDS.some((kw) =>
-    normalized.includes(kw)
-  );
-  return startsOk && !hasForbidden;
-}
 
 /**
  * Throws if schemaName is not in the allowed list.
@@ -65,7 +36,7 @@ async function tableExists(pool, schemaName, tableName) {
  *
  * @param {import('pg').Pool} pool
  */
-export function createMcpTools(pool) {
+export function createMcpTools(pool, { queryTimeoutMs = 5000 } = {}) {
   return {
     get_database_health: {
       description:
@@ -153,29 +124,7 @@ export function createMcpTools(pool) {
         required: ["sql"]
       },
       async execute({ sql }) {
-        const trimmed = String(sql || "").trim();
-
-        if (!trimmed) {
-          throw new Error("SQL query must not be empty.");
-        }
-
-        if (trimmed.includes(";")) {
-          throw new Error(
-            "Multiple statements are not allowed. Remove the semicolon."
-          );
-        }
-
-        if (!isReadOnlySql(trimmed)) {
-          throw new Error(
-            "Only read-only SELECT or WITH queries are allowed. Write and DDL commands are blocked."
-          );
-        }
-
-        const result = await pool.query(trimmed);
-        return {
-          rowCount: result.rowCount,
-          rows: result.rows.slice(0, 500)
-        };
+        return executeReadOnlyQuery(pool, sql, { timeoutMs: queryTimeoutMs });
       }
     },
 
