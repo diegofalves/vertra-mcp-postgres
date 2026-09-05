@@ -33,12 +33,36 @@ test("database and MCP routes reject requests without a bearer token", async () 
       ["/db/tables", undefined],
       ["/db/query", { method: "POST", headers: { "content-type": "application/json" }, body: '{"sql":"SELECT 1"}' }],
       ["/sse", undefined],
+      ["/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' }],
+      ["/mcp", { method: "POST", headers: { authorization: "Bearer wrong-secret", "content-type": "application/json" }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' }],
       ["/message?sessionId=missing", { method: "POST" }],
     ]) {
       const response = await fetch(`${baseUrl}${path}`, init);
       assert.equal(response.status, 401, path);
       assert.deepEqual(await response.json(), { error: "Unauthorized" });
     }
+  });
+});
+
+test("streamable HTTP accepts a valid bearer token for initialization", async () => {
+  const pool = { query: async () => ({ rows: [] }) };
+  await withServer({ pool, apiKey: "test-secret" }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-secret",
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } }
+      })
+    });
+    assert.equal(response.status, 200);
+    assert.ok(response.headers.get("mcp-session-id"));
   });
 });
 

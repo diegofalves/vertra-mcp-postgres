@@ -1,10 +1,12 @@
-import crypto from "node:crypto";
+import crypto, { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import cors from "cors";
 import express from "express";
 import pg from "pg";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 import { createMcpServer } from "./mcp-server.js";
 import { attachExpressErrorHandler, captureException, initObservability } from "./observability.js";
@@ -129,6 +131,56 @@ export function createApp({
   app.use(bearerAuth(String(apiKey)));
 
   const sseTransports = new Map();
+  const streamableTransports = new Map();
+
+  app.all(
+    "/mcp",
+    express.json({ limit: "32kb" }),
+    async (req, res) => {
+      let transport;
+      const sessionId = req.get("mcp-session-id");
+
+      if (sessionId) {
+        transport = streamableTransports.get(sessionId);
+        if (!transport) {
+          return res.status(404).json({ error: "MCP session not found" });
+        }
+      } else if (req.method === "POST" && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (initializedSessionId) => {
+            streamableTransports.set(initializedSessionId, transport);
+            console.log("MCP streamable session initialized");
+          }
+        });
+        transport.onclose = () => {
+          const closedSessionId = transport.sessionId;
+          if (closedSessionId) streamableTransports.delete(closedSessionId);
+          console.log("MCP streamable session closed");
+        };
+        transport.onerror = (error) => {
+          captureException(error);
+          console.error("MCP streamable transport error");
+        };
+
+        const mcpServer = createMcpServer(pool, { queryTimeoutMs });
+        await mcpServer.connect(transport);
+      } else {
+        return res.status(400).json({ error: "MCP session is required" });
+      }
+
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        captureException(error);
+        console.error("Error handling MCP streamable request");
+        if (!res.headersSent) {
+          return res.status(500).json({ error: "Internal server error" });
+        }
+      }
+      return undefined;
+    }
+  );
 
   app.get("/sse", async (req, res) => {
     if (!pool) {

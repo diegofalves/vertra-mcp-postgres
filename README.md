@@ -1,12 +1,13 @@
 # vertra-mcp-postgres
 
-Read-only MCP server that exposes a Railway PostgreSQL database to Claude agents via the Model Context Protocol (MCP) over SSE transport.
+Read-only MCP server that exposes a Railway PostgreSQL database to Claude agents via the Model Context Protocol (MCP) over Streamable HTTP, with legacy SSE fallback.
 
 ## How it works
 
 The server runs as an Express HTTP service with two layers:
 
-- **MCP/SSE layer** — `GET /sse` opens a persistent SSE connection; `POST /message` receives client-to-server messages. Each connection gets its own MCP `Server` instance.
+- **MCP/Streamable HTTP layer** — `POST/GET/DELETE /mcp` serves the preferred stateful Streamable HTTP transport. Each session gets its own MCP `Server` instance.
+- **MCP/SSE layer** — `GET /sse` opens a persistent legacy SSE connection; `POST /message` receives client-to-server messages.
 - **HTTP/DB layer** — REST endpoints (`/health`, `/db/health`, `/db/tables`, `/db/query`) for direct inspection and health checks.
 
 `/health` and `/ready` are public probes. Every MCP or database route requires
@@ -41,7 +42,7 @@ DATABASE_URL_READONLY=postgres://... MCP_API_KEY=... npm start
 
 ## MCP tools
 
-These are the tools advertised to Claude agents when they connect via SSE.
+These are the tools advertised to Claude agents when they connect via Streamable HTTP or legacy SSE.
 
 ### `get_database_health`
 
@@ -79,13 +80,15 @@ Returns the total row count for a given table. Validates that the table exists b
 
 ## Connecting a Claude agent (Agent SDK)
 
-### SSE endpoint
+### Streamable HTTP endpoint
 
-Point the MCP toolset at the deployed service's `/sse` endpoint:
+Point the MCP toolset at the deployed service's `/mcp` endpoint. The client must send the API key as an `Authorization: Bearer` header. Store the key in the client's secret store; never put it in the URL, repository or logs.
 
-The client must send the API key as an `Authorization: Bearer` header. Store
-the key in the client's secret store; never put it in the URL, repository or
-logs.
+The legacy `/sse` endpoint remains available as a fallback for clients that do not support Streamable HTTP.
+
+### Agent SDK example
+
+The MCP toolset URL in the example below may be `/mcp` (preferred) or `/sse` (legacy fallback):
 
 ```python
 import anthropic
@@ -169,8 +172,9 @@ This unblocks only that one call. The next call will block again unless you upda
 | `GET` | `/db/health` | Authenticated DB connectivity check |
 | `GET` | `/db/tables` | Authenticated table list for allowed schemas |
 | `POST` | `/db/query` | Authenticated optional REST query; disabled by default |
-| `GET` | `/sse` | Opens an authenticated MCP SSE connection |
-| `POST` | `/message?sessionId=<id>` | Authenticated MCP client-to-server channel |
+| `POST/GET/DELETE` | `/mcp` | Authenticated MCP Streamable HTTP session |
+| `GET` | `/sse` | Opens an authenticated legacy MCP SSE connection |
+| `POST` | `/message?sessionId=<id>` | Authenticated legacy MCP client-to-server channel |
 
 ## Validation
 
