@@ -11,17 +11,22 @@ async function withServer(options, callback) {
   try {
     await callback(`http://127.0.0.1:${port}`);
   } finally {
-    await new Promise((resolve, reject) =>
+    const closePromise = new Promise((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve()))
     );
+    server.closeAllConnections?.();
+    await closePromise;
   }
 }
 
 test("health endpoints remain public", async () => {
   const pool = { query: async () => ({ rows: [{ value: 1 }] }) };
   await withServer({ pool, apiKey: "test-secret" }, async (baseUrl) => {
-    assert.equal((await fetch(`${baseUrl}/health`)).status, 200);
-    assert.equal((await fetch(`${baseUrl}/ready`)).status, 200);
+    const health = await fetch(`${baseUrl}/health`);
+    const ready = await fetch(`${baseUrl}/ready`);
+    assert.equal(health.status, 200);
+    assert.equal(ready.status, 200);
+    await Promise.all([health.arrayBuffer(), ready.arrayBuffer()]);
   });
 });
 
