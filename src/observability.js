@@ -1,4 +1,6 @@
-import * as Sentry from "@sentry/node";
+const Sentry = String(process.env.SENTRY_DSN || "").trim()
+  ? await import("@sentry/node")
+  : null;
 
 let enabled = false;
 
@@ -23,7 +25,7 @@ export function scrubEvent(event) {
 
 export function initObservability() {
   const dsn = String(process.env.SENTRY_DSN || "").trim();
-  if (!dsn) return false;
+  if (!dsn || !Sentry) return false;
   const parsedRate = Number.parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || "0.05");
   Sentry.init({
     dsn,
